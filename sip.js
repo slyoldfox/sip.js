@@ -6,7 +6,6 @@ var dgram = require('dgram');
 var tls = require('tls');
 var os = require('os');
 var crypto = require('crypto');
-var WebSocket = require('ws');
 
 function debug(e) {
   if(e.stack) {
@@ -586,9 +585,10 @@ function makeStreamTransport(protocol, maxBytesHeaders, maxContentLength, connec
     });
 
     stream.on('timeout',  function() { if(refs === 0) stream.destroy(); });
-    stream.setTimeout(120000);   
+    stream.setKeepAlive(true, 60000)
+    //stream.setTimeout(120000);
     stream.setMaxListeners(10000);
- 
+
     remotes[remoteid] = function(onError) {
       ++refs;
       if(onError) stream.on('error', onError);
@@ -611,7 +611,7 @@ function makeStreamTransport(protocol, maxBytesHeaders, maxContentLength, connec
   }
 
   var server = createServer(function(stream) {
-    init(stream, {protocol: protocol, address: stream.remoteAddress, port: stream.remotePort});  
+    init(stream, {protocol: protocol, address: stream.remoteAddress, port: stream.remotePort});
   });
 
   return {
@@ -628,16 +628,16 @@ function makeStreamTransport(protocol, maxBytesHeaders, maxContentLength, connec
 
       return c && c(error);
     },
-    destroy: function() { server.close(); }
+    destroy: function() { if(server) server.close(); }
   };
 }
 
 function makeTlsTransport(options, callback) {
   return makeStreamTransport(
-    'TLS', 
+    'TLS',
     options.maxBytesHeaders,
     options.maxContentLength,
-    function(port, host, callback) { return tls.connect(port, host, options.tls, callback); }, 
+    function(port, host, callback) { return tls.connect(port, host, options.tls, callback); },
     function(callback) {
       var server = tls.createServer(options.tls, callback);
       server.listen(options.tls_port || 5061, options.address);
@@ -660,111 +660,10 @@ function makeTcpTransport(options, callback) {
     callback);
 }
 
-function makeWsTransport(options, callback) {
-  var flows = Object.create(null);
-  var clients = Object.create(null);
-
-  
-  function init(ws) {
-    var remote = {address: ws._socket.remoteAddress, port: ws._socket.remotePort},
-        local = {address: ws._socket.address().address, port: ws._socket.address().port},
-        flowid = [remote.address, remote.port, local.address, local.port].join();
-
-    flows[flowid] = ws;
-
-    ws.on('close', function() { delete flows[flowid]; });
-    ws.on('message', function(data) {
-      var msg = parseMessage(data);
-      if(msg) {
-        callback(msg, {protocol: 'WS', address: remote.address, port: remote.port, local: local});
-      }
-    });
-  }
-
-  function makeClient(uri) {
-    if(clients[uri]) return clients[uri]();
-
-    var socket = new WebSocket(uri, 'sip', {procotol: 'sip'}),
-        queue = [],
-        refs = 0;
-    
-    function send_connecting(m) { queue.push(stringify(m)); }
-    function send_open(m) { socket.send(new Buffer.from(typeof m === 'string' ? m : stringify(m), 'binary')); }
-    var send = send_connecting;
-
-    socket.on('open', function() { 
-      init(socket); 
-      send = send_open;
-      queue.splice(0).forEach(send);
-    });
-
-    function open(onError) {
-      ++refs;
-      if(onError) socket.on('error', onError);
-      return {
-        send: function(m) { send(m); },
-        release: function() {
-          if(onError) socket.removeListener('error', onError);
-          if(--refs === 0) socket.terminate();
-        },
-        protocol: 'WS'
-      };
-    };
-
-    return clients[uri] = open;
-  }
-
-  if(options.ws_port) {
-    if(options.tls) {
-      var http = require('https');
-      var server = new WebSocket.Server({
-          server: http.createServer(options.tls, function(rq,rs) { 
-            rs.writeHead(200);
-            rs.end("");
-          }).listen(options.ws_port)
-      });
-    } 
-    else {
-      var server = new WebSocket.Server({port:options.ws_port});
-    }
-
-    server.on('connection',init);
-  }
-
-  function get(flow) {
-    var ws = flows[[flow.address, flow.port, flow.local.address, flow.local.port].join()];
-    if(ws) {
-      return {
-        send: function(m) { ws.send(stringify(m)); },
-        release: function() {},
-        protocol: 'WS'
-      };
-    } else {
-        console.log("Failed to get ws for target. Target/flow was:");
-        console.log(util.inspect(flow));
-        console.log("Flows[] were:");
-        console.log(util.inspect(flows));
-    }
-  }
-
-  function open(target, onError) {
-    if(target.local)
-      return get(target); 
-    else
-      return makeClient('ws://'+target.host+':'+target.port)(onError);
-  }
-
-  return {
-    get: open,
-    open: open,
-    destroy: function() { server.close(); }
-  }
-}
-
 function makeUdpTransport(options, callback) {
   function onMessage(data, rinfo) {
     var msg = parseMessage(data);
-   
+
     if(msg && checkMessage(msg)) {
       if(msg.method) {
         msg.headers.via[0].params.received = rinfo.address;
@@ -779,20 +678,20 @@ function makeUdpTransport(options, callback) {
   var address = options.address || '0.0.0.0';
   var port = options.port || 5060;
 
-  var socket = dgram.createSocket(net.isIPv6(address) ? 'udp6' : 'udp4', onMessage); 
+  var socket = dgram.createSocket(net.isIPv6(address) ? 'udp6' : 'udp4', onMessage);
   socket.bind(port, address);
 
   function open(remote, error) {
     return {
       send: function(m) {
         var s = stringify(m);
-        socket.send(new Buffer.from(s, 'binary'), 0, s.length, remote.port, remote.address);          
+        socket.send(new Buffer.from(s, 'binary'), 0, s.length, remote.port, remote.address);
       },
       protocol: 'UDP',
       release : function() {}
-    }; 
+    };
   };
-  
+
   return {
     open: open,
     get: open,
@@ -810,15 +709,13 @@ function makeTransport(options, callback) {
       callback(m, remote, stream);
     }
   }
-  
+
   if(options.udp === undefined || options.udp)
-    protocols.UDP = makeUdpTransport(options, callbackAndLog); 
+    protocols.UDP = makeUdpTransport(options, callbackAndLog);
   if(options.tcp === undefined || options.tcp)
     protocols.TCP = makeTcpTransport(options, callbackAndLog);
   if(options.tls)
     protocols.TLS = makeTlsTransport(options, callbackAndLog);
-  if(options.ws_port && WebSocket)
-    protocols.WS = makeWsTransport(options, callbackAndLog);
 
   function wrap(obj, target) {
     return Object.create(obj, {send: {value: function(m) {
